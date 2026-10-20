@@ -45,8 +45,15 @@ Terminal.app: Settings → Profiles → Keyboard → **Use Option as Meta key**.
 
 3. **Install Neovim** with the included `update-nvim` script (no sudo needed).
    It installs the newest 0.11.x into `~/.local/opt` and links it as `~/.local/bin/nvim`.
-   Make sure `~/.local/bin` is on your `PATH` before `/usr/bin` (and, on macOS, before
-   `/opt/homebrew/bin`, or `brew uninstall neovim`).
+   `~/.local/bin` must be on your `PATH` before `/usr/bin` and `/opt/homebrew/bin`; add it
+   if `echo $PATH` doesn't start with it, then open a new terminal:
+
+   ```sh
+   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc    # macOS (zsh)
+   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # Linux (bash)
+   ```
+
+   Then install:
 
    ```sh
    mkdir -p ~/.local/bin
