@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# Update the user-local Neovim in ~/.local/opt, linked from ~/.local/bin/nvim.
+#
+#   update-nvim             update to the newest release in the current series (0.11.x on a first install)
+#   update-nvim --latest    update to the newest stable release, even a new series (e.g. 0.12)
+#   update-nvim --check     only show what would be installed
+#   update-nvim --rollback  switch back to the previously installed version
+#   update-nvim --list      list installed versions
+#
+# Downloads come from the official GitHub releases and are checked against the
+# sha256 digest GitHub publishes. Old versions are kept in ~/.local/opt.
+set -euo pipefail
+
+OPT_DIR="$HOME/.local/opt"
+LINK="$HOME/.local/bin/nvim"
+API="https://api.github.com/repos/neovim/neovim/releases?per_page=100"
+SERIES="0.11" # series to install when none is installed yet (the one the config targets)
+
+case "$(uname -s)" in
+  Linux) OS="linux" ;;
+  Darwin) OS="macos" ;;
+  *) echo "update-nvim: unsupported system $(uname -s)" >&2; exit 1 ;;
+esac
+case "$(uname -m)" in
+  x86_64) ASSET="nvim-$OS-x86_64.tar.gz" ;;
+  aarch64 | arm64) ASSET="nvim-$OS-arm64.tar.gz" ;;
+  *) echo "update-nvim: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+esac
+
+# macOS has shasum but not always sha256sum
+if command -v sha256sum >/dev/null; then
+  SHA256SUM="sha256sum"
+else
+  SHA256SUM="shasum -a 256"
+fi
+
+die() { echo "update-nvim: $*" >&2; exit 1; }
+
+# Version the link points at now, e.g. 0.11.7 (empty if none)
+current_version() {
+  [ -L "$LINK" ] || return 0
+  readlink "$LINK" | sed -nE 's#.*/nvim-([0-9]+\.[0-9]+\.[0-9]+)/bin/nvim$#\1#p'
+}
+
+installed_versions() {
+  find "$OPT_DIR" -maxdepth 1 -type d -name 'nvim-[0-9]*' 2>/dev/null \
+    | sed 's#^.*/nvim-##' | sort -V
+}
+
+switch_to() {
+  local version="$1" bin="$OPT_DIR/nvim-$1/bin/nvim"
+  [ -x "$bin" ] || die "$bin not found"
+  mkdir -p "$(dirname "$LINK")"
+  ln -sfn "$bin" "$LINK"
+  echo "nvim now runs: $("$LINK" --version | head -1)"
+}
+
+mode="update"
+case "${1:-}" in
+  "") ;;
+  --latest) mode="latest" ;;
+  --check) mode="check" ;;
+  --rollback) mode="rollback" ;;
+  --list) mode="list" ;;
+  -h | --help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) die "unknown option '$1' (try --help)" ;;
+esac
+
+current="$(current_version)"
+
+if [ "$mode" = "list" ]; then
+  for v in $(installed_versions); do
+    [ "$v" = "$current" ] && echo "* $v (current)" || echo "  $v"
+  done
+  exit 0
+fi
+
+if [ "$mode" = "rollback" ]; then
+  [ -n "$current" ] || die "no current version linked at $LINK"
+  previous="$(installed_versions | awk -v cur="$current" '$0 == cur { print prev; exit } { prev = $0 }')"
+  [ -n "$previous" ] || die "no version older than $current installed (see --list)"
+  echo "Switching back from $current to $previous"
+  switch_to "$previous"
+  exit 0
+fi
+
+# Stable releases only (no nightly/prereleases), newest first
+releases="$(curl -fsSL "$API")" || die "could not reach GitHub"
+tags="$(jq -r '.[] | select(.prerelease == false and .draft == false) | .tag_name' <<<"$releases" \
+  | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -rV)"
+
+if [ "$mode" = "latest" ]; then
+  target="$(head -1 <<<"$tags")"
+else
+  series="${current%.*}" # 0.11.7 -> 0.11
+  series="${series:-$SERIES}"
+  target="$(grep -E "^${series//./\\.}\.[0-9]+$" <<<"$tags" | head -1 || true)"
+  newest="$(head -1 <<<"$tags")"
+  [ -n "$target" ] || die "no releases found in the $series series"
+fi
+[ -n "$target" ] || die "no stable releases found"
+
+echo "Installed: ${current:-none}"
+echo "Available: $target"
+if [ "$mode" != "latest" ] && [ "${newest:-$target}" != "$target" ]; then
+  echo "(Newer series available: $newest. Use --latest to update to it.)"
+fi
+
+if [ "$target" = "$current" ]; then
+  echo "Already up to date."
+  exit 0
+fi
+[ "$mode" = "check" ] && exit 0
+
+dest="$OPT_DIR/nvim-$target"
+if [ -x "$dest/bin/nvim" ]; then
+  echo "$target is already downloaded."
+  switch_to "$target"
+  exit 0
+fi
+
+digest="$(jq -r --arg tag "v$target" --arg asset "$ASSET" \
+  '.[] | select(.tag_name == $tag) | .assets[] | select(.name == $asset) | .digest // empty' <<<"$releases")"
+digest="${digest#sha256:}"
+[ -n "$digest" ] || die "GitHub lists no sha256 digest for $ASSET in v$target; not installing unverified"
+
+tmp="$(mktemp -d)"
+trap 'command rm -rf "$tmp"' EXIT
+
+echo "Downloading v$target..."
+curl -fsSL -o "$tmp/$ASSET" "https://github.com/neovim/neovim/releases/download/v$target/$ASSET"
+echo "$digest  $tmp/$ASSET" | $SHA256SUM -c --quiet - || die "checksum mismatch; download discarded"
+echo "Checksum OK."
+
+mkdir -p "$tmp/unpack"
+tar -xzf "$tmp/$ASSET" -C "$tmp/unpack" --strip-components=1
+"$tmp/unpack/bin/nvim" --version >/dev/null || die "downloaded nvim does not run"
+
+mkdir -p "$OPT_DIR"
+mv "$tmp/unpack" "$dest"
+switch_to "$target"
+if [ -n "$current" ]; then
+  echo "Previous version $current kept; 'update-nvim --rollback' switches back."
+fi
